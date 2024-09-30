@@ -3,7 +3,6 @@
 import torch
 import torch.nn.functional as F
 
-
 import causal_conv1d_cuda
 
 
