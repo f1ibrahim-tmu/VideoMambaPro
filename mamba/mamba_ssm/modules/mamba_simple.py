@@ -31,25 +31,6 @@ except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
 
 
-def mask_diagonal(A):
-    """
-    将输入矩阵的对角线元素置为0
-    
-    参数：
-        A: 输入的矩阵
-        
-    返回：
-        masked_A: 对角线元素被置为0后的矩阵
-    """
-    # 创建一个与A形状相同的零矩阵
-    masked_A = torch.clone(A)
-    # 获取A矩阵的对角线元素的索引
-    diagonal_indices = torch.arange(min(A.size(0), A.size(1)))
-    # 将对角线元素置为0
-    masked_A[diagonal_indices, diagonal_indices] = 0
-    return masked_A
-
-
 class Mamba(nn.Module):
     def __init__(
         self,
@@ -69,7 +50,9 @@ class Mamba(nn.Module):
         layer_idx=None,
         device=None,
         dtype=None,
-        bimamba=True,
+        bimamba_type="none",
+        if_divide_out=False,
+        init_layer_scale=None,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -81,7 +64,12 @@ class Mamba(nn.Module):
         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
         self.use_fast_path = use_fast_path
         self.layer_idx = layer_idx
-        self.bimamba = bimamba
+        self.bimamba_type = bimamba_type
+        self.if_divide_out = if_divide_out
+
+        self.init_layer_scale = init_layer_scale
+        if init_layer_scale is not None:
+            self.gamma = nn.Parameter(init_layer_scale * torch.ones((d_model)), requires_grad=True)
 
         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
 
@@ -125,7 +113,6 @@ class Mamba(nn.Module):
         self.dt_proj.bias._no_reinit = True
 
         # S4D real initialization
-        # NOTE: why plus 1?
         A = repeat(
             torch.arange(1, self.d_state + 1, dtype=torch.float32, device=device),
             "n -> d n",
@@ -140,8 +127,7 @@ class Mamba(nn.Module):
         self.D._no_weight_decay = True
 
         # bidirectional
-        # forked from https://github.com/hustvl/Vim
-        if self.bimamba:
+        if bimamba_type == "v1":
             A_b = repeat(
                 torch.arange(1, self.d_state + 1, dtype=torch.float32, device=device),
                 "n -> d n",
@@ -149,7 +135,15 @@ class Mamba(nn.Module):
             ).contiguous()
             A_b_log = torch.log(A_b)  # Keep A_b_log in fp32
             self.A_b_log = nn.Parameter(A_b_log)
-	    self.A_b_log = mask_diagnomal (A_b_log)
+            self.A_b_log._no_weight_decay = True
+        elif bimamba_type == "v2":
+            A_b = repeat(
+                torch.arange(1, self.d_state + 1, dtype=torch.float32, device=device),
+                "n -> d n",
+                d=self.d_inner,
+            ).contiguous()
+            A_b_log = torch.log(A_b)  # Keep A_b_log in fp32
+            self.A_b_log = nn.Parameter(A_b_log)
             self.A_b_log._no_weight_decay = True 
 
             self.conv1d_b = nn.Conv1d(
@@ -171,12 +165,19 @@ class Mamba(nn.Module):
             self.D_b._no_weight_decay = True
 
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+        #帮助debug进程
+        self.has_printed_init = False
 
-    def forward(self, hidden_states, inference_params=None, T=1):
+    def forward(self, hidden_states, inference_params=None):
         """
         hidden_states: (B, L, D)
         Returns: same shape as hidden_states
         """
+        # 检查是否已经打印过初始化信息，如果没有则打印
+        if not self.has_printed_init:
+            #print("The Mamba module is initialized")
+            # 将标记设置为True，以防止再次打印
+            self.has_printed_init = True
         batch, seqlen, dim = hidden_states.shape
 
         conv_state, ssm_state = None, None
@@ -188,7 +189,6 @@ class Mamba(nn.Module):
                 return out
 
         # We do matmul and transpose BLH -> HBL at the same time
-        # NOTE: same as in_proj(hidden_states) but memory-efficient with the following operations
         xz = rearrange(
             self.in_proj.weight @ rearrange(hidden_states, "b l d -> d (b l)"),
             "d (b l) -> b d l",
@@ -200,7 +200,26 @@ class Mamba(nn.Module):
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
         # In the backward pass we write dx and dz next to each other to avoid torch.cat
         if self.use_fast_path and inference_params is None:  # Doesn't support outputting the states
-            if self.bimamba:
+            if self.bimamba_type == "v1":
+                A_b = -torch.exp(self.A_b_log.float())
+                out = bimamba_inner_fn(
+                    xz,
+                    self.conv1d.weight,
+                    self.conv1d.bias,
+                    self.x_proj.weight,
+                    self.dt_proj.weight,
+                    self.out_proj.weight,
+                    self.out_proj.bias,
+                    A,
+                    A_b,
+                    None,  # input-dependent B
+                    None,  # input-dependent C
+                    self.D.float(),
+                    delta_bias=self.dt_proj.bias.float(),
+                    delta_softplus=True,
+                ) 
+                #print("use fast path and V1:", self.use_fast_path)
+            elif self.bimamba_type == "v2":
                 A_b = -torch.exp(self.A_b_log.float())
                 out = mamba_inner_fn_no_out_proj(
                     xz,
@@ -228,7 +247,13 @@ class Mamba(nn.Module):
                     delta_bias=self.dt_proj_b.bias.float(),
                     delta_softplus=True,
                 )
-                out = F.linear(rearrange(out + out_b.flip([-1]), "b d l -> b l d"), self.out_proj.weight, self.out_proj.bias)
+                #print("use fast path and V2", self.use_fast_path)
+                # F.linear(rearrange(out_z, "b d l -> b l d"), out_proj_weight, out_proj_bias)
+                if not self.if_divide_out:
+                    out = F.linear(rearrange(out + out_b.flip([-1]), "b d l -> b l d"), self.out_proj.weight, self.out_proj.bias)
+                else:
+                    out = F.linear(rearrange(out + out_b.flip([-1]), "b d l -> b l d") / 2, self.out_proj.weight, self.out_proj.bias)
+
             else:
                 out = mamba_inner_fn(
                     xz,
@@ -245,20 +270,23 @@ class Mamba(nn.Module):
                     delta_bias=self.dt_proj.bias.float(),
                     delta_softplus=True,
                 )
+                #print("use fast path and simple mamba")
         else:
             x, z = xz.chunk(2, dim=1)
             # Compute short convolution
             if conv_state is not None:
-                conv_state.copy_(x[:, :, -self.d_conv :])  # Update state (B D W)
+                # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
+                # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
+                conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # Update state (B D W)
             if causal_conv1d_fn is None:
                 x = self.act(self.conv1d(x)[..., :seqlen])
             else:
                 assert self.activation in ["silu", "swish"]
                 x = causal_conv1d_fn(
-                    x,
-                    rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                    self.conv1d.bias,
-                    self.activation,
+                    x=x,
+                    weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
                 )
 
             # We're careful here about the layout, to avoid extra transposes.
@@ -288,6 +316,9 @@ class Mamba(nn.Module):
                 ssm_state.copy_(last_state)
             y = rearrange(y, "b d l -> b l d")
             out = self.out_proj(y)
+            print("no use fast path and simple")
+        if self.init_layer_scale is not None:
+                out = out * self.gamma    
         return out
 
     def step(self, hidden_states, conv_state, ssm_state):

@@ -8,20 +8,19 @@ we investigate similarities and differences of self-attention and Mamba from the
 The required packages are in the file `requirements.txt`, and you can run the following command to install the environment
 
 ```
-conda create --name videomae python=3.8 -y
+conda create -n videomambapro python=3.10
 conda activate videomambapro
 
-conda install pytorch==1.12.1 torchvision==0.13.1 torchaudio==0.12.1 -c pytorch
+conda install cudatoolkit==11.8 -c nvidia
+pip install torch==2.1.1 torchvision==0.16.1 torchaudio==2.1.1 --index-url https://download.pytorch.org/whl/cu118
 
+conda install -c "nvidia/label/cuda-11.8.0" cuda-nvcc
+conda install packaging
+
+pip install causal_conv1d==1.4.0 (we recommend to install through .whl file)
+pip install mamba-ssm
 pip install -r requirements.txt
 ```
-
-### Note:
-- **The above commands are for reference only**, please configure your own environment according to your needs.
-- We recommend installing **`PyTorch >= 1.12.0`**, which may greatly reduce the GPU memory usage.
-- It is recommended to install **`timm == 0.4.12`**, because some of the APIs we use are deprecated in the latest version of timm.
-- We have supported pre-training with `PyTorch 2.0`, but it has not been fully tested.
-
 
 # Data Preparation
 We read and process the same way as [VideoMAE](https://github.com/MCG-NJU/VideoMAE/blob/main/DATASET.md), but with a different convention for the format of the data list file. 
@@ -62,11 +61,19 @@ your_path/SomethingV2/frames/151151 31 166
 ```
 # Codes details
 Our project is based on VideoMamba for fair comparison. To solve limitation 1&2 in our paper, we mainly change the pipeline of Mamba by applying the diagonal mask during the backward SSM and applying residual connection on the bidirection SSM.
-The  residual connection of Ab is realized through assign new matrix A in mamba/mamba_ssm/ops/selective_scan_interface.py
+The  residual connection of Ab is realized in function selective_scan_ref in mamba/mamba_ssm/ops/selective_scan_interface.py, and the key option is below:
 ```
-A = deltaA[:, :, i] + deltaA[:, :, x.index]
+x = u[:, :, 0].unsqueeze(-1).expand(-1, -1, dstate)
+x = deltaA[:, :, i] * x + deltaB_u[:, :, i]
 ```
-The mask assignment is realized through setting elements of A_b in mamba/mamba_ssm/modules/mamba_simple.py
+The mask assignment is realized through setting two selective functions, namely selective_scan_ref, and selective_scan_ref_sub in mamba/mamba_ssm/ops/selective_scan_interface.py.
+When computing the bidirectional mamba, e.g., in bimamba_inner_ref of mamba/mamba_ssm/ops/selective_scan_interface.py, the key code is below:
 ```
-self.A_b_log = mask_diagnomal (A_b_log)
+y = selective_scan_fn(x, delta, A, B, C, D, z=z, delta_bias=delta_bias, delta_softplus=True)
+y_b = selective_scan_ref_sub(x.flip([-1]), delta.flip([-1]), A_b, B.flip([-1]), C.flip([-1]), D, z.flip([-1]), delta_bias, delta_softplus=True)
+y = y + y_b.flip([-1])
 ```
+
+# Work Plans
+1. release the model weights
+2. release the results on Imagenet-1K
