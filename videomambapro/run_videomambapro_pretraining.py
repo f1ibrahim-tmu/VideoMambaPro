@@ -12,7 +12,7 @@ from pathlib import Path
 from timm.models import create_model
 from .optim_factory import create_optimizer
 from datasets.build import build_pretraining_dataset
-from .engines.engine_for_pretraining_videomamba import train_one_epoch
+from engines.engine_for_pretraining_videomambapro import train_one_epoch
 from utils import NativeScalerWithGradNormCount as NativeScaler
 from utils import multiple_pretrain_samples_collate
 import utils
