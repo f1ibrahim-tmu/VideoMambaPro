@@ -3,7 +3,7 @@ import math
 import numpy as np
 import random
 import torch
-import torchvision.transforms.functional as FF
+import torchvision.transforms.functional as F
 from PIL import Image
 from torchvision import transforms
 
@@ -14,7 +14,8 @@ import numbers
 import PIL
 import torchvision
 
-#import functional as FF
+import videomambapro.functional as FF
+#import .functional as FF
 
 _pil_interpolation_to_str = {
     Image.NEAREST: "PIL.Image.NEAREST",

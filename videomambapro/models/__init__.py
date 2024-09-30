@@ -15,12 +15,12 @@ from .modeling_pretrain import (
     pretrain_videomae_huge_patch16_224 
 )
 from .deit import deit_tiny_patch16_224
-from .videomamba import (
+from .videomambapro import (
     videomamba_tiny, 
     videomamba_small, 
     videomamba_middle, 
 )
 
-from .videomamba_pretrain import (
+from .videomambapro_pretrain import (
     videomamba_middle_pretrain
 )
