@@ -10,9 +10,8 @@ from functools import partial
 
 from pathlib import Path
 from timm.models import create_model
-from optim_factory import create_optimizer
-#from VideoMambaPro.datasets.build import build_pretraining_dataset
-import build
+from .optim_factory import create_optimizer
+from datasets.build import build_pretraining_dataset
 from .engines.engine_for_pretraining_videomamba import train_one_epoch
 from utils import NativeScalerWithGradNormCount as NativeScaler
 from utils import multiple_pretrain_samples_collate
@@ -200,7 +199,7 @@ def main(args):
 
   
     # get dataset
-    dataset_train = build.build_pretraining_dataset(args)
+    dataset_train = build_pretraining_dataset(args)
 
     num_tasks = utils.get_world_size()
     global_rank = utils.get_rank()
